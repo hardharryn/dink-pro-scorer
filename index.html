@@ -1,0 +1,226 @@
+<!doctype html>
+<html lang="en">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Dinkpro Court Scores</title>
+	<style>
+		@import url('https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@600;700&family=DM+Sans:wght@400;500;600;700&display=swap');
+		:root { color-scheme: light; --ink: #17251f; --muted: #64716a; --green: #17684d; --line: #d7dfd9; --paper: #ffffff; }
+		* { box-sizing: border-box; }
+		body { margin: 0; background: var(--paper); color: var(--ink); font-family: 'DM Sans', sans-serif; letter-spacing: 0; }
+		.wrap { min-height: 100vh; min-height: 100dvh; display: flex; flex-direction: column; }
+		#courts { flex: 1; display: grid; grid-template-columns: minmax(0, 1fr); grid-auto-rows: minmax(320px, 1fr); }
+		.court { display: grid; grid-template-rows: auto repeat(2, minmax(110px, 1fr)); background: var(--paper); min-width: 0; border-bottom: 1px solid var(--line); animation: enter .25s ease-out; }
+		.court-heading { padding: 20px 32px; border-bottom: 1px solid var(--line); }
+		h3 { font-size: 24px; margin: 0; overflow-wrap: anywhere; }
+		.team { display: grid; grid-template-columns: minmax(0, 1fr) minmax(100px, auto); align-items: center; gap: 24px; padding: 28px 32px; min-width: 0; }
+		.team + .team { border-top: 1px solid var(--line); }
+		.names { font-size: 32px; line-height: 1.5; overflow-wrap: anywhere; }
+		.player { display: block; }
+		.score { font-family: 'Barlow Condensed', sans-serif; font-size: 96px; text-align: right; line-height: 1; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; min-width: 0; }
+		#notice { padding: 14px 16px; border-left: 3px solid #be722e; background: #fff3e8; margin-bottom: 22px; font-size: 14px; line-height: 1.5; }
+		#notice[hidden] { display: none; }
+		.empty { grid-column: 1 / -1; padding: 46px 0; color: var(--muted); border-block: 1px solid var(--line); }
+		@keyframes enter { from { opacity: 0; } to { opacity: 1; } }
+		@media (prefers-reduced-motion: reduce) { .court { animation: none; } }
+		@media (max-width: 660px) { .court-heading { padding: 16px 20px; } h3 { font-size: 20px; } .team { padding: 20px; gap: 16px; grid-template-columns: minmax(0, 1fr) minmax(64px, auto); } .names { font-size: 22px; } .score { font-size: 64px; } }
+	</style>
+</head>
+<body>
+	<main class="wrap">
+		<div id="notice" role="alert" hidden></div>
+		<section id="courts" aria-label="Court scores" aria-busy="true"><div class="empty">Connecting to Dinkpro...</div></section>
+	</main>
+	<script>
+		const ENDPOINT = 'https://fqvjauptgpqqgzdjtpac.supabase.co/rest/v1/rpc/get_live_session_v4';
+		const PUBLIC_KEY = 'sb_publishable_t7jd-auBVXY-l7yZfQVqyg_ghaoU031';
+		const byId = id => document.getElementById(id);
+		const parameters = new URLSearchParams(window.location.search);
+		const selectedCourt = parameters.get('court');
+		const background = parameters.get('bg');
+		if (background) {
+			const color = /^(?:[\da-f]{3}|[\da-f]{4}|[\da-f]{6}|[\da-f]{8})$/i.test(background) ? `#${background}` : background;
+			if (CSS.supports('color', color)) {
+				document.documentElement.style.setProperty('--paper', color);
+				const canvas = document.createElement('canvas');
+				canvas.width = canvas.height = 1;
+				const context = canvas.getContext('2d');
+				context.fillStyle = '#ffffff';
+				context.fillRect(0, 0, 1, 1);
+				context.fillStyle = color;
+				context.fillRect(0, 0, 1, 1);
+				const channels = [...context.getImageData(0, 0, 1, 1).data].slice(0, 3).map(channel => {
+					const value = channel / 255;
+					return value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4;
+				});
+				const luminance = channels[0] * 0.2126 + channels[1] * 0.7152 + channels[2] * 0.0722;
+				const dark = luminance < 0.179;
+				document.documentElement.style.setProperty('--ink', dark ? '#ffffff' : '#17251f');
+				document.documentElement.style.setProperty('--muted', dark ? '#dddddd' : '#64716a');
+				document.documentElement.style.setProperty('--line', dark ? '#ffffff33' : '#00000022');
+			}
+		}
+		let activeCode = '54E7D3ED46A3';
+		let controller;
+		let timer;
+		let lastView = '';
+		let hasData = false;
+
+		function element(tag, className, text) {
+			const node = document.createElement(tag);
+			node.className = className;
+			if (text !== undefined) node.textContent = text;
+			return node;
+		}
+
+		function readCode(value) {
+			const input = value.trim();
+			let code = input;
+			if (/^https?:\/\//i.test(input)) {
+				const url = new URL(input);
+				if (!['www.dinkpro.app', 'dinkpro.app'].includes(url.hostname)) throw new Error('Enter a dinkpro.app live URL.');
+				code = url.searchParams.get('code') || '';
+			}
+			if (!/^[a-z0-9]{12}$/i.test(code)) throw new Error('Enter a valid 12-character Dinkpro session code.');
+			return code.toUpperCase();
+		}
+
+		function liveGames(tournament, match) {
+			if (!tournament.settings?.liveScoring || match.status !== 'playing') return null;
+			const settings = match.bracket === 'group' && tournament.groupStage ? tournament.groupStage.scoring : tournament.settings;
+			const preset = match.bracket === 'reset' ? 'one15' : settings.scoringPreset;
+			const targets = { house11: 11, one11: 11, one15: 15, one21: 21, best3to11: 11 };
+			const target = preset === 'custom' ? (settings.customTarget ?? 15) : (targets[preset] ?? 11);
+			const winBy = preset === 'custom' ? (settings.customWinBy ?? 2) : 2;
+			const winsRequired = (preset === 'custom' ? settings.customBestOf === 3 : preset === 'best3to11') ? 2 : 1;
+			const live = match.live || { firstServer: 0, system: tournament.settings.liveScoringSystem || 'sideout', rallies: [] };
+			const doublesSideout = live.system === 'sideout' && tournament.format === 'doubles';
+			const games = [];
+			let points = [0, 0];
+			let wins = [0, 0];
+			let serving = live.firstServer;
+			let server = doublesSideout ? 2 : 1;
+			for (const winner of live.rallies) {
+				if (live.system === 'rally') { points[winner]++; serving = winner; }
+				else if (winner === serving) points[winner]++;
+				else if (doublesSideout && server === 1) server = 2;
+				else { serving = 1 - serving; server = 1; }
+				if (Math.max(...points) >= target && Math.abs(points[0] - points[1]) >= winBy) {
+					const winnerSide = points[0] > points[1] ? 0 : 1;
+					games.push({ a: points[0], b: points[1] });
+					wins[winnerSide]++;
+					if (wins[winnerSide] >= winsRequired) return games;
+					points = [0, 0];
+					serving = games.length % 2 ? 1 - live.firstServer : live.firstServer;
+					server = doublesSideout ? 2 : 1;
+				}
+			}
+			return [...games, { a: points[0], b: points[1] }];
+		}
+
+		function tournamentCourts(tournament) {
+			const entries = new Map((tournament.entries || []).map(entry => [entry.id, entry]));
+			return (tournament.courts || []).map(court => {
+				const match = (tournament.matches || []).find(item => item.courtId === court.id && ['playing', 'assigned'].includes(item.status));
+				if (!match) return { name: court.name || court.id, status: court.available === false ? 'Closed' : 'Available', teams: [], meta: 'No active match' };
+				const games = liveGames(tournament, match) || match.result?.games || [];
+				return {
+					name: court.name || court.id,
+					status: match.pausedAt !== undefined || tournament.pausedAt !== undefined ? 'Paused' : match.status === 'playing' ? 'Playing' : 'Called to court',
+					teams: (match.entryIds || [null, null]).map((id, side) => {
+						const entry = entries.get(id);
+						return { names: entry?.playerNames?.length ? entry.playerNames : [entry?.name || 'To be decided'], score: games.length ? games.map(game => side === 0 ? game.a : game.b).join(' / ') : null };
+					}),
+					meta: `${match.bracket || 'Match'} round ${match.round || 1} | ${match.id}`
+				};
+			});
+		}
+
+		function openPlayCourts(state) {
+			const players = new Map((state.players || []).map(player => [player.id, player.name]));
+			return (state.courts || []).map(court => {
+				const match = court.match;
+				return { name: court.label || court.name || court.id, status: match ? 'Playing' : 'Available', meta: match ? 'Open play' : 'No active match', teams: match ? ['teamA', 'teamB'].map((side, index) => ({ names: (match[side] || []).map(player => typeof player === 'string' ? players.get(player) || player : player.name), score: match[index === 0 ? 'scoreA' : 'scoreB'] ?? null })) : [] };
+			});
+		}
+
+		function render(data) {
+			const state = data.state;
+			if (!state || typeof state !== 'object') throw new Error('Session not found or no longer shared. Check the code or open Dinkpro.');
+			const allCourts = state.tournament ? tournamentCourts(state.tournament) : openPlayCourts(state);
+			const courts = selectedCourt === null ? allCourts : allCourts.filter((court, index) => index + 1 === Number(selectedCourt));
+			const view = JSON.stringify({ courts, name: state.orgName, status: data.status });
+			if (view !== lastView) {
+				const fragment = document.createDocumentFragment();
+				for (const court of courts) {
+					const card = element('article', 'court');
+					const heading = element('div', 'court-heading');
+					heading.append(element('h3', '', court.name));
+					card.append(heading);
+					for (const team of court.teams) {
+						const row = element('div', 'team');
+						const names = element('div', 'names');
+						for (const name of team.names) names.append(element('span', 'player', name));
+						const score = element('div', 'score', team.score ?? '\u2014');
+						score.setAttribute('aria-label', `${team.names.join(' & ')} score: ${team.score ?? 'not recorded'}`);
+						row.append(names, score);
+						card.append(row);
+					}
+					if (!court.teams.length) card.append(element('div', 'team', 'No active match'));
+					fragment.append(card);
+				}
+				if (!courts.length) fragment.append(element('div', 'empty', selectedCourt === null ? 'No courts published for this session.' : `Court ${selectedCourt} not found.`));
+				byId('courts').replaceChildren(fragment);
+				lastView = view;
+			}
+			hasData = true;
+			return data.status;
+		}
+
+		function notice(message) {
+			byId('notice').textContent = message;
+			byId('notice').hidden = !message;
+		}
+
+		async function refresh() {
+			clearTimeout(timer);
+			if (controller) controller.abort();
+			const request = new AbortController();
+			controller = request;
+			const timeout = setTimeout(() => request.abort(), 12000);
+			byId('courts').setAttribute('aria-busy', 'true');
+			try {
+				const response = await fetch(ENDPOINT, { method: 'POST', headers: { apikey: PUBLIC_KEY, 'Content-Type': 'application/json' }, body: JSON.stringify({ p_join_code: activeCode }), signal: request.signal });
+				if (!response.ok) throw new Error(`Dinkpro returned HTTP ${response.status}.`);
+				const payload = await response.json();
+				if (controller !== request) return;
+				render(payload);
+				notice('');
+			} catch (error) {
+				if (controller !== request) return;
+				notice(`${hasData ? 'Showing last received scores. ' : ''}${error.name === 'AbortError' ? 'The request timed out.' : error.message === 'Failed to fetch' ? 'Cannot reach Dinkpro. Check your connection or browser access restrictions.' : error.message} Retrying in 5 seconds.`);
+				if (!hasData) byId('courts').replaceChildren(element('div', 'empty', 'Scores unavailable. Waiting to reconnect.'));
+			} finally {
+				clearTimeout(timeout);
+				if (controller === request) {
+					controller = null;
+					byId('courts').setAttribute('aria-busy', 'false');
+					timer = setTimeout(refresh, 5000);
+				}
+			}
+		}
+
+		try {
+			activeCode = readCode(parameters.get('ur') ?? activeCode);
+			if (selectedCourt !== null && !/^[1-9]\d*$/.test(selectedCourt)) throw new Error('The court parameter must be a positive court number.');
+			window.addEventListener('online', refresh);
+			refresh();
+		} catch (error) {
+			byId('courts').replaceChildren();
+			byId('courts').setAttribute('aria-busy', 'false');
+			notice(error.message);
+		}
+	</script>
+</body>
+</html>
